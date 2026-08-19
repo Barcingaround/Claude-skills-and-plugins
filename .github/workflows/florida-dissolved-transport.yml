@@ -1,0 +1,114 @@
+name: Florida dissolved-district transport
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install acquisition dependencies
+        run: pip install requests pandas openpyxl selenium beautifulsoup4 lxml
+      - name: Acquire official Excel/PDF and normalize
+        run: |
+          mkdir -p acquisition_output/downloads
+          cat > /tmp/acquire.py <<'PY'
+          import hashlib, json, pathlib, re, sys, time
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=pathlib.Path('acquisition_output'); dl=out/'downloads'; dl.mkdir(parents=True,exist_ok=True)
+          page='https://www.floridajobs.org/community-development/community-planning/special-districts/special-district-accountability-program/official-list-of-special-districts'
+          base='https://specialdistrictreports.floridajobs.org'
+          urls=[base+'/OfficialList/DissolvedDistrictExcel',base+'/OfficialList/DissolvedDistrictPDF',base+'/OfficialList/OfficialDissolvedDistricts',base+'/OfficialList/EffectiveDissolvedDistricts']
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/pdf;q=0.8,*/*;q=0.7','Referer':page}
+          s=requests.Session(); attempts=[]; found={}
+          try:
+            r=s.get(page,headers=headers,timeout=60); (out/'official_page.html').write_bytes(r.content)
+            attempts.append({'method':'requests_page','status':r.status_code,'bytes':len(r.content),'final_url':r.url,'content_type':r.headers.get('content-type')})
+            soup=BeautifulSoup(r.content,'lxml')
+            for a in soup.find_all('a',href=True):
+              href=urljoin(r.url,a['href']); text=' '.join(a.get_text(' ',strip=True).split())
+              if 'dissolv' in (href+' '+text).lower(): urls.append(href)
+          except Exception as e: attempts.append({'method':'requests_page','error':repr(e)})
+          seen=set()
+          for u in urls:
+            if not u or u in seen: continue
+            seen.add(u)
+            for candidate in (u,u+'/' if not u.endswith('/') else u,u+('?download=1' if '?' not in u else '&download=1')):
+              try:
+                r=s.get(candidate,headers=headers,timeout=120,allow_redirects=True); data=r.content; sig=data[:8]
+                kind='excel' if sig.startswith(b'PK') else ('pdf' if sig.startswith(b'%PDF') else 'html')
+                attempts.append({'method':'requests','url':candidate,'status':r.status_code,'bytes':len(data),'kind':kind,'final_url':r.url,'content_type':r.headers.get('content-type'),'sha256':hashlib.sha256(data).hexdigest()})
+                if r.status_code==200 and kind in ('excel','pdf'):
+                  p=dl/('FloridaCommerce_Current_Dissolved_Districts.xlsx' if kind=='excel' else 'FloridaCommerce_Current_Dissolved_Districts.pdf'); p.write_bytes(data); found[kind]=str(p)
+              except Exception as e: attempts.append({'method':'requests','url':candidate,'error':repr(e)})
+            if 'excel' in found and 'pdf' in found: break
+
+          if 'excel' not in found:
+            try:
+              from selenium import webdriver
+              from selenium.webdriver.chrome.options import Options
+              from selenium.webdriver.common.by import By
+              opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1920,1080')
+              opts.add_experimental_option('prefs',{'download.default_directory':str(dl.resolve()),'download.prompt_for_download':False,'download.directory_upgrade':True,'safebrowsing.enabled':True})
+              d=webdriver.Chrome(options=opts); d.execute_cdp_cmd('Page.setDownloadBehavior',{'behavior':'allow','downloadPath':str(dl.resolve())})
+              for source in (page,base+'/OfficialList/OfficialDissolvedDistricts',base+'/OfficialList/EffectiveDissolvedDistricts',base+'/OfficialList/DissolvedDistrictExcel'):
+                try:
+                  d.get(source); time.sleep(4); key=re.sub(r'[^A-Za-z0-9]+','_',source)[-70:]
+                  (out/f'{key}.html').write_text(d.page_source,encoding='utf-8'); d.save_screenshot(str(out/f'{key}.png'))
+                  attempts.append({'method':'selenium_page','url':source,'current_url':d.current_url,'title':d.title,'html_bytes':len(d.page_source.encode())})
+                  hrefs=[]
+                  for a in d.find_elements(By.TAG_NAME,'a'):
+                    href=a.get_attribute('href') or ''; text=' '.join((a.text or '').split())
+                    if 'dissolv' in (href+' '+text).lower() or 'excel' in (href+' '+text).lower(): hrefs.append(href)
+                  for href in hrefs+[base+'/OfficialList/DissolvedDistrictExcel']:
+                    before={p.name for p in dl.iterdir()}; d.get(href)
+                    for _ in range(30):
+                      time.sleep(1); files=[p for p in dl.iterdir() if p.name not in before and not p.name.endswith('.crdownload')]
+                      if files:
+                        p=max(files,key=lambda x:x.stat().st_mtime); data=p.read_bytes(); sig=data[:8]; kind='excel' if sig.startswith(b'PK') else ('pdf' if sig.startswith(b'%PDF') else 'other')
+                        attempts.append({'method':'selenium_download','href':href,'path':str(p),'bytes':len(data),'kind':kind,'sha256':hashlib.sha256(data).hexdigest()})
+                        if kind=='excel': target=dl/'FloridaCommerce_Current_Dissolved_Districts.xlsx'; p.replace(target); found['excel']=str(target)
+                        elif kind=='pdf': target=dl/'FloridaCommerce_Current_Dissolved_Districts.pdf'; p.replace(target); found['pdf']=str(target)
+                        break
+                    if 'excel' in found: break
+                except Exception as e: attempts.append({'method':'selenium_page','url':source,'error':repr(e)})
+                if 'excel' in found: break
+              d.quit()
+            except Exception as e: attempts.append({'method':'selenium','error':repr(e)})
+
+          result={'status':'SOURCE_NOT_ACQUIRED','found':found,'attempts':attempts}
+          if 'excel' in found:
+            import pandas as pd
+            x=pathlib.Path(found['excel']); book=pd.ExcelFile(x,engine='openpyxl'); candidates=[]; sheets={}
+            for sh in book.sheet_names:
+              raw=pd.read_excel(x,sheet_name=sh,header=None,dtype=str,engine='openpyxl').fillna(''); sheets[sh]={'rows':len(raw),'columns':raw.shape[1]}; candidates.append((len(raw),sh,raw))
+            _,sh,raw=max(candidates,key=lambda z:z[0]); keys=('district','status','dissolv','county','dependency','date'); best=(-1,0)
+            for i in range(min(30,len(raw))):
+              score=sum(any(k in str(v).lower() for k in keys) for v in raw.iloc[i].tolist()); best=max(best,(score,i))
+            header=best[1]; df=pd.read_excel(x,sheet_name=sh,header=header,dtype=str,engine='openpyxl').dropna(how='all').fillna(''); df.columns=[str(c).strip() for c in df.columns]
+            csvp=out/'FloridaCommerce_Current_Dissolved_Districts.csv'; jsonp=out/'FloridaCommerce_Current_Dissolved_Districts.json'; df.to_csv(csvp,index=False); jsonp.write_text(json.dumps(df.to_dict(orient='records'),indent=2,ensure_ascii=False),encoding='utf-8')
+            result.update({'status':'PASS','rows':len(df),'columns':list(df.columns),'sheet_selected':sh,'header_row_zero_based':header,'sheets':sheets,'excel_sha256':hashlib.sha256(x.read_bytes()).hexdigest(),'csv_sha256':hashlib.sha256(csvp.read_bytes()).hexdigest(),'json_sha256':hashlib.sha256(jsonp.read_bytes()).hexdigest()})
+          (out/'FETCH_RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True),encoding='utf-8'); print(json.dumps(result,indent=2))
+          if result['status']!='PASS': sys.exit(2)
+          PY
+          python /tmp/acquire.py
+      - name: Upload acquisition result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: florida-dissolved-acquisition
+          path: acquisition_output
+          if-no-files-found: error
+          retention-days: 7
